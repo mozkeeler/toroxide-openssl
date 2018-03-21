@@ -10,19 +10,13 @@ use openssl::rsa::{Padding, Rsa};
 use openssl::ssl::{Ssl, SslContext, SslMethod, SslStream, SslVerifyMode};
 use openssl::x509::{X509, X509Builder, X509NameBuilder};
 use std::io::{Read, Write};
-use std::net::{IpAddr, SocketAddr, TcpStream};
 
-pub struct TlsOpensslImpl {
-    stream: SslStream<TcpStream>,
+pub struct TlsOpensslImpl<T: Read + Write> {
+    stream: SslStream<T>,
 }
 
-impl TlsOpensslImpl {
-    pub fn connect(ip: IpAddr, port: u16) -> Result<Self, ()> {
-        let addrs = [SocketAddr::new(ip, port)];
-        let stream = match TcpStream::connect(&addrs[..]) {
-            Ok(stream) => stream,
-            Err(_) => return Err(()),
-        };
+impl<T: Read + Write> TlsOpensslImpl<T> {
+    pub fn connect(stream: T) -> Result<Self, ()> {
         let mut ssl_context_builder = match SslContext::builder(SslMethod::tls()) {
             Ok(ssl_context_builder) => ssl_context_builder,
             Err(_) => return Err(()),
@@ -46,7 +40,7 @@ impl TlsOpensslImpl {
     }
 }
 
-impl toroxide::TlsImpl for TlsOpensslImpl {
+impl<T: Read + Write> toroxide::TlsImpl for TlsOpensslImpl<T> {
     fn get_peer_cert_hash(&self) -> Result<[u8; 32], ()> {
         let peer_cert = match self.stream.ssl().peer_certificate() {
             Some(peer_cert) => peer_cert,
@@ -77,13 +71,13 @@ impl toroxide::TlsImpl for TlsOpensslImpl {
     }
 }
 
-impl Read for TlsOpensslImpl {
+impl<T: Read + Write> Read for TlsOpensslImpl<T> {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
         self.stream.read(buf)
     }
 }
 
-impl Write for TlsOpensslImpl {
+impl<T: Read + Write> Write for TlsOpensslImpl<T> {
     fn write(&mut self, data: &[u8]) -> Result<usize, std::io::Error> {
         self.stream.write(data)
     }
