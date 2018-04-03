@@ -7,19 +7,23 @@ use openssl::hash::{Hasher, MessageDigest};
 use openssl::pkey::{PKey, Private};
 use openssl::rand::rand_bytes;
 use openssl::rsa::{Padding, Rsa};
-use openssl::ssl::{Ssl, SslContext, SslMethod, SslStream, SslVerifyMode};
+use openssl::ssl::{HandshakeError, MidHandshakeSslStream, Ssl, SslContext, SslMethod, SslStream,
+                   SslVerifyMode};
 use openssl::x509::{X509, X509Builder, X509NameBuilder};
-use std::io::{Read, Write};
+use std::io::{Error, ErrorKind, Read, Write};
+use toroxide::Async;
 
-pub struct TlsOpensslImpl<T: Read + Write> {
-    stream: SslStream<T>,
+pub struct PendingTlsOpensslImpl<T: Read + Write> {
+    ssl: Option<Ssl>,
+    stream: Option<T>,
+    mid_handshake_stream: Option<MidHandshakeSslStream<T>>,
 }
 
-impl<T: Read + Write> TlsOpensslImpl<T> {
-    pub fn connect(stream: T) -> Result<Self, ()> {
+impl<T: Read + Write> PendingTlsOpensslImpl<T> {
+    pub fn new(stream: T) -> Result<Self, Error> {
         let mut ssl_context_builder = match SslContext::builder(SslMethod::tls()) {
             Ok(ssl_context_builder) => ssl_context_builder,
-            Err(_) => return Err(()),
+            Err(e) => return Err(Error::new(ErrorKind::Other, e)),
         };
         ssl_context_builder.set_verify_callback(SslVerifyMode::PEER, |_, _| {
             // We're do the "in-protocol" handshake, so we don't verify the peer's TLS certificate.
@@ -28,37 +32,81 @@ impl<T: Read + Write> TlsOpensslImpl<T> {
         let ssl_context = ssl_context_builder.build();
         let ssl = match Ssl::new(&ssl_context) {
             Ok(ssl) => ssl,
-            Err(_) => return Err(()),
+            Err(e) => return Err(Error::new(ErrorKind::Other, e)),
         };
-        let ssl_connected = match ssl.connect(stream) {
-            Ok(ssl_connected) => ssl_connected,
-            Err(_) => return Err(()),
-        };
-        Ok(TlsOpensslImpl {
-            stream: ssl_connected,
+        Ok(PendingTlsOpensslImpl {
+            ssl: Some(ssl),
+            stream: Some(stream),
+            mid_handshake_stream: None,
         })
+    }
+
+    fn handle_connect_or_handshake_result(
+        &mut self,
+        result: Result<SslStream<T>, HandshakeError<T>>,
+    ) -> Result<Async<TlsOpensslImpl<T>>, Error> {
+        match result {
+            Ok(ssl_connected) => Ok(Async::Ready(TlsOpensslImpl {
+                stream: ssl_connected,
+            })),
+            Err(e) => match e {
+                HandshakeError::SetupFailure(e) => Err(Error::new(ErrorKind::Other, e)),
+                HandshakeError::Failure(_) => Err(Error::new(ErrorKind::Other, "handshake error")),
+                HandshakeError::WouldBlock(mid_handshake_stream) => {
+                    self.mid_handshake_stream = Some(mid_handshake_stream);
+                    Ok(Async::NotReady)
+                }
+            },
+        }
+    }
+
+    pub fn poll(&mut self) -> Result<Async<TlsOpensslImpl<T>>, Error> {
+        if let Some(ssl) = self.ssl.take() {
+            if let Some(stream) = self.stream.take() {
+                self.handle_connect_or_handshake_result(ssl.connect(stream))
+            } else {
+                Err(Error::new(
+                    ErrorKind::Other,
+                    "library error: ssl and stream should both be Some here",
+                ))
+            }
+        } else if let Some(mid_handshake_stream) = self.mid_handshake_stream.take() {
+            self.handle_connect_or_handshake_result(mid_handshake_stream.handshake())
+        } else {
+            Err(Error::new(
+                ErrorKind::Other,
+                "library error: shouldn't reach this point",
+            ))
+        }
     }
 }
 
+pub struct TlsOpensslImpl<T: Read + Write> {
+    stream: SslStream<T>,
+}
+
 impl<T: Read + Write> toroxide::TlsImpl for TlsOpensslImpl<T> {
-    fn get_peer_cert_hash(&self) -> Result<[u8; 32], ()> {
+    fn get_peer_cert_hash(&self) -> Result<[u8; 32], Error> {
         let peer_cert = match self.stream.ssl().peer_certificate() {
             Some(peer_cert) => peer_cert,
-            None => return Err(()),
+            None => return Err(Error::new(ErrorKind::Other, "no peer certificate?")),
         };
         let fingerprint = match peer_cert.fingerprint(MessageDigest::sha256()) {
             Ok(fingerprint) => fingerprint,
-            Err(_) => return Err(()),
+            Err(e) => return Err(Error::new(ErrorKind::Other, e)),
         };
         if fingerprint.len() != 32 {
-            return Err(());
+            return Err(Error::new(
+                ErrorKind::Other,
+                "OpenSSL SHA256 implementation not 32 bytes?",
+            ));
         }
         let mut result: [u8; 32] = [0; 32];
         result.copy_from_slice(&fingerprint);
         Ok(result)
     }
 
-    fn get_tls_secrets(&self, label: &str, context_key: &[u8]) -> Result<Vec<u8>, ()> {
+    fn get_tls_secrets(&self, label: &str, context_key: &[u8]) -> Result<Vec<u8>, Error> {
         let mut buf: Vec<u8> = Vec::with_capacity(32);
         buf.resize(32, 0);
         match self.stream
@@ -66,23 +114,23 @@ impl<T: Read + Write> toroxide::TlsImpl for TlsOpensslImpl<T> {
             .export_keying_material(&mut buf, label, Some(context_key))
         {
             Ok(()) => Ok(buf),
-            Err(_) => Err(()),
+            Err(e) => Err(Error::new(ErrorKind::Other, e)),
         }
     }
 }
 
 impl<T: Read + Write> Read for TlsOpensslImpl<T> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, std::io::Error> {
+    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Error> {
         self.stream.read(buf)
     }
 }
 
 impl<T: Read + Write> Write for TlsOpensslImpl<T> {
-    fn write(&mut self, data: &[u8]) -> Result<usize, std::io::Error> {
+    fn write(&mut self, data: &[u8]) -> Result<usize, Error> {
         self.stream.write(data)
     }
 
-    fn flush(&mut self) -> Result<(), std::io::Error> {
+    fn flush(&mut self) -> Result<(), Error> {
         self.stream.flush()
     }
 }
